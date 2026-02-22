@@ -56,11 +56,15 @@ LINK INSIGHTS:
  - **Auth**: google-auth-library (Cloud Run service-to-service ID token)
  - **Scraping**: JSDOM, @mozilla/readability
  - **LLM**: NanoClaw (POST /summarize) — Cloud Run 서비스
+ - **Bot**: grammY (Telegram Bot API) — Express 웹훅 어댑터
 ## 환경 변수 설정
  - `CLIENT_ID`, `CLIENT_SECRET`, `REFRESH_TOKEN`: Gmail OAuth2 인증 (gmail.modify + gmail.send 스코프 필요)
  - `EMAIL_FROM`, `EMAIL_TO`: 발신 및 수신 메일 주소
  - `IMPORTANT_SENDERS`: 쉼표로 구분된 중요 발신자 리스트
  - `NANOCLAW_URL`: NanoClaw 요약 API 엔드포인트 (Cloud Run URL)
+ - `TELEGRAM_BOT_TOKEN`: Telegram 봇 토큰 (선택 — 미설정 시 봇 비활성화)
+ - `TELEGRAM_ALLOWED_USERS`: 쉼표로 구분된 허용 Telegram 사용자 ID
+ - `TELEGRAM_WEBHOOK_SECRET`: 웹훅 요청 검증용 시크릿 토큰 (선택, 권장)
 
 ## 배포 및 운영
  - **플랫폼**: Google Cloud Run (asia-northeast3)
@@ -68,5 +72,17 @@ LINK INSIGHTS:
  - **스케줄**: Cloud Scheduler `digest-daily-run` — 매일 오전 8시 (KST)
  - **인증**: digest-worker SA → `roles/run.invoker` on nanoclaw-run
  - **중복 방지**: Gmail `DIGESTED` 라벨 기반 (gmail.modify 스코프 없으면 graceful skip)
- - **엔드포인트**: `GET /health`, `GET /run-digest`
+ - **엔드포인트**: `GET /health`, `GET /run-digest`, `POST /telegram/webhook`
  - **분류 임계값**: 본문 <500자 + 링크 존재 → LINK-FOCUSED, 그 외 → CONTENT-FOCUSED
+
+## 모듈 구조
+ - `src/index.ts`: Express 서버, 라우팅, Telegram 웹훅 초기화 (~50줄)
+ - `src/digest.ts`: Digest 오케스트레이션 — Gmail 읽기 → 필터 → 스크래핑 → 요약 → 이메일 발송
+ - `src/telegram.ts`: Telegram 봇 — grammY 기반 명령어 핸들러, 인증 미들웨어, 동시성 가드
+
+## Telegram 봇
+ - `/digest` — 전체 digest 사이클 실행 (동시 실행 방지)
+ - `/status` — 마지막 digest 실행 정보 (성공/실패, 항목 수, 소요 시간)
+ - `/help` — 사용 가능한 명령어 목록
+ - 인증: `TELEGRAM_ALLOWED_USERS`에 등록된 사용자만 접근 가능
+ - 웹훅 설정: `curl -X POST "https://api.telegram.org/bot<TOKEN>/setWebhook" -d "url=<CLOUD_RUN_URL>/telegram/webhook&secret_token=<SECRET>"`

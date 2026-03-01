@@ -1,5 +1,5 @@
 import { Bot, Context } from "grammy";
-import { runDigest, DigestResult } from "./digest";
+import { runDigest, DigestResult, validateTimeRange } from "./digest";
 
 /* ─── State ─── */
 
@@ -28,9 +28,10 @@ export function createBot(token: string, allowedUsers: number[]): Bot {
   bot.command("help", (ctx) =>
     ctx.reply(
       "📋 Commands:\n" +
-        "/digest — Run a full digest cycle\n" +
+        "/digest [range] — Run digest (e.g. /digest 3d)\n" +
         "/status — Last digest run info\n" +
-        "/help — Show this message",
+        "/help — Show this message\n\n" +
+        "Range: 1d–30d, 1h–24h (default: 1d)"
     ),
   );
 
@@ -52,11 +53,22 @@ async function handleDigest(ctx: Context): Promise<void> {
     return;
   }
 
-  await ctx.reply("🔄 Running digest...");
+  const arg = ((ctx.match as string) || "").trim();
+  const timeRange = arg || "1d";
+
+  if (arg) {
+    const validation = validateTimeRange(timeRange);
+    if (!validation.valid) {
+      await ctx.reply(`❌ ${validation.error}`);
+      return;
+    }
+  }
+
+  await ctx.reply(`🔄 Running digest (${timeRange})...`);
   isRunning = true;
 
   try {
-    const result = await runDigest();
+    const result = await runDigest(timeRange);
     lastRun = { time: new Date(), result };
 
     if (result.success) {

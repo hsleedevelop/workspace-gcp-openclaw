@@ -119,6 +119,30 @@ function classifyEmail(
   return "CONTENT";
 }
 
+/* ─── Time Range Validation ─── */
+
+const TIME_RANGE_RE = /^(\d+)([dhm])$/;
+
+const RANGE_LIMITS: Record<string, [number, number, string]> = {
+  d: [1, 30, "1–30 days"],
+  h: [1, 24, "1–24 hours"],
+  m: [1, 60, "1–60 minutes"],
+};
+
+export function validateTimeRange(input: string): { valid: boolean; error?: string } {
+  const match = input.match(TIME_RANGE_RE);
+  if (!match) return { valid: false, error: `Invalid format "${input}". Use e.g. 1d, 3d, 12h.` };
+
+  const value = parseInt(match[1], 10);
+  const unit = match[2];
+  const [min, max, label] = RANGE_LIMITS[unit];
+  if (value < min || value > max) {
+    return { valid: false, error: `Out of range: ${input}. Allowed: ${label}.` };
+  }
+
+  return { valid: true };
+}
+
 /* ─── Link Scraping (jsdom + @mozilla/readability) ─── */
 
 const SCRAPE_TIMEOUT_MS = 10_000;
@@ -224,7 +248,7 @@ export interface DigestResult {
   digest: string;
 }
 
-export async function runDigest(): Promise<DigestResult> {
+export async function runDigest(timeRange: string = "1d"): Promise<DigestResult> {
   const start = Date.now();
   console.log("[digest] run started");
 
@@ -250,7 +274,7 @@ export async function runDigest(): Promise<DigestResult> {
     }
     const senderQuery = senders.map((s) => `from:${s}`).join(" OR ");
     const dedupFilter = labelId ? ` -label:${DIGEST_LABEL}` : "";
-    const query = `(${senderQuery}) newer_than:1d${dedupFilter}`;
+    const query = `(${senderQuery}) newer_than:${timeRange}${dedupFilter}`;
     console.log("[digest] query:", query);
 
     const list = await gmail.users.messages.list({

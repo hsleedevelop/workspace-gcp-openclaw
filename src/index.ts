@@ -1,6 +1,6 @@
 import express from "express";
 import { webhookCallback } from "grammy";
-import { runDigest } from "./digest";
+import { runDigest, validateTimeRange } from "./digest";
 import { createBot } from "./telegram";
 
 const app = express();
@@ -12,8 +12,16 @@ app.get("/health", (_, res) => {
   res.send("ok");
 });
 
-app.get("/run-digest", async (_, res) => {
-  const result = await runDigest();
+app.get("/run-digest", async (req, res) => {
+  const range = (req.query.range as string) || "1d";
+
+  const validation = validateTimeRange(range);
+  if (!validation.valid) {
+    res.status(400).send(validation.error);
+    return;
+  }
+
+  const result = await runDigest(range);
   if (result.success) {
     res.send(result.message);
   } else {

@@ -77,9 +77,27 @@ export function buildRawEmail(
   );
 }
 
+function isJunkUrl(url: string): boolean {
+  try {
+    const u = new URL(url);
+    if (u.hostname === "localhost" || u.hostname === "127.0.0.1") return true;
+    if (u.searchParams.has("code") && u.searchParams.has("scope")) return true;
+    if (u.pathname.toLowerCase().includes("unsubscribe")) return true;
+    if (/\.(png|jpg|jpeg|gif|svg|ico|webp|bmp)(\?|$)/i.test(u.pathname))
+      return true;
+    const junkPrefixes = ["click.", "track.", "open.", "pixel.", "beacon."];
+    if (junkPrefixes.some((p) => u.hostname.startsWith(p))) return true;
+    if (/\/(track|open|click|pixel)\//i.test(u.pathname)) return true;
+    return false;
+  } catch {
+    return true;
+  }
+}
+
 function extractLinks(text: string): string[] {
   const regex = /(https?:\/\/[^\s<>"')\]]+)/g;
-  return Array.from(new Set(text.match(regex) || []));
+  const raw = Array.from(new Set(text.match(regex) || []));
+  return raw.filter((url) => !isJunkUrl(url));
 }
 
 function isImportantSender(from: string, whitelist: string[]): boolean {
@@ -109,14 +127,39 @@ function extractBody(payload: Record<string, unknown>): string {
   return "";
 }
 
-// threshold: <500 chars body + links present → scrape links; otherwise summarize body
-function classifyEmail(
-  bodyLength: number,
-  linkCount: number,
-): "CONTENT" | "LINK" {
-  if (linkCount === 0) return "CONTENT";
-  if (bodyLength < 500 && linkCount > 0) return "LINK";
-  return "CONTENT";
+function extractHtmlBody(payload: Record<string, unknown>): string {
+  if (!payload) return "";
+  const mime = payload.mimeType as string | undefined;
+  const bodyData = (payload.body as Record<string, unknown>)?.data as
+    | string
+    | undefined;
+  if (mime === "text/html" && bodyData) {
+    return Buffer.from(bodyData, "base64").toString("utf8");
+  }
+  const parts = payload.parts as Record<string, unknown>[] | undefined;
+  if (parts) {
+    for (const part of parts) {
+      const html = extractHtmlBody(part);
+      if (html) return html;
+    }
+  }
+  return "";
+}
+
+function extractLinksFromHtml(html: string): string[] {
+  if (!html) return [];
+  try {
+    const dom = new JSDOM(html);
+    const anchors = dom.window.document.querySelectorAll("a[href]");
+    const urls: string[] = [];
+    for (const a of anchors) {
+      const href = a.getAttribute("href");
+      if (href && /^https?:\/\//.test(href)) urls.push(href);
+    }
+    return urls;
+  } catch {
+    return [];
+  }
 }
 
 /* ─── Time Range Validation ─── */
@@ -147,7 +190,7 @@ export function validateTimeRange(input: string): { valid: boolean; error?: stri
 
 const SCRAPE_TIMEOUT_MS = 10_000;
 const MAX_SCRAPED_LENGTH = 5_000;
-const MAX_LINKS_PER_EMAIL = 3;
+const MAX_LINKS_PER_EMAIL = 5;
 
 async function scrapeLink(url: string): Promise<string> {
   try {
@@ -290,7 +333,7 @@ export async function runDigest(timeRange: string = "1d"): Promise<DigestResult>
     }
 
     console.log(`[digest] found ${list.data.messages.length} candidate(s)`);
-    const results: string[] = [];
+    const senderGroups = new Map<string, string[]>();
 
     for (const msg of list.data.messages) {
       const m = await gmail.users.messages.get({
@@ -306,22 +349,28 @@ export async function runDigest(timeRange: string = "1d"): Promise<DigestResult>
 
       if (!isImportantSender(from, senders)) continue;
 
-      const body = extractBody(
-        m.data.payload as unknown as Record<string, unknown>,
-      );
+      const payload = m.data.payload as unknown as Record<string, unknown>;
+      const body = extractBody(payload);
+      const htmlBody = extractHtmlBody(payload);
       const snippet = m.data.snippet || "";
       const text = body || snippet;
-      const links = extractLinks(text);
-      const emailType = classifyEmail(text.length, links.length);
+
+      // Extract links from both plain text and HTML parts
+      const textLinks = extractLinks(text);
+      const htmlLinks = extractLinksFromHtml(htmlBody).filter(
+        (url) => !isJunkUrl(url),
+      );
+      const links = [...new Set([...textLinks, ...htmlLinks])];
 
       console.log(
-        `[digest] "${subject}" type=${emailType} links=${links.length} bodyLen=${text.length}`,
+        `[digest] "${subject}" from="${from}" links=${links.length} bodyLen=${text.length}`,
       );
 
       let summary = "";
 
       try {
-        if (emailType === "LINK" && links.length > 0) {
+        if (links.length > 0) {
+          // Always scrape links — this is the core of the digest
           const scraped = await Promise.allSettled(
             links.slice(0, MAX_LINKS_PER_EMAIL).map((l) => scrapeLink(l)),
           );
@@ -354,34 +403,54 @@ export async function runDigest(timeRange: string = "1d"): Promise<DigestResult>
             subject,
             from,
             text,
-            links,
+            [],
           );
         }
       } catch (e) {
         console.error(`[digest] summarize failed for "${subject}":`, e);
-        summary = snippet;
+        summary = `(Summarization failed) ${snippet}`;
       }
 
-      results.push(`### ${subject}\n${summary}`);
+      const senderKey = from.replace(/<[^>]+>/g, "").trim() || from;
+      if (!senderGroups.has(senderKey)) senderGroups.set(senderKey, []);
+      senderGroups.get(senderKey)!.push(`TITLE: ${subject}\n\n${summary}`);
 
       if (labelId) {
         await markDigested(gmail, msg.id!, labelId).catch((e) =>
-          console.warn(`[digest] failed to mark digested: ${(e as Error).message}`),
+          console.warn(
+            `[digest] failed to mark digested: ${(e as Error).message}`,
+          ),
         );
       }
     }
 
-    if (!results.length) {
-      console.log("[digest] no important messages after filtering");
-      const elapsed = ((Date.now() - start) / 1000).toFixed(1);
-      return { success: true, itemCount: 0, elapsed, message: "No important messages", digest: "" };
+    let totalItems = 0;
+    const digestParts: string[] = [];
+
+    for (const [sender, items] of senderGroups) {
+      totalItems += items.length;
+      digestParts.push(
+        `══ From: ${sender} ══\n\n${items.join("\n\n---\n\n")}`,
+      );
     }
 
-    const digest = results.join("\n\n---\n\n");
+    if (!totalItems) {
+      console.log("[digest] no important messages after filtering");
+      const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+      return {
+        success: true,
+        itemCount: 0,
+        elapsed,
+        message: "No important messages",
+        digest: "",
+      };
+    }
+
+    const digest = digestParts.join("\n\n\n");
     const raw = buildRawEmail(
       env.EMAIL_FROM,
       env.EMAIL_TO,
-      `\u{1F4EC} Daily Research Digest (${results.length})`,
+      `\u{1F4EC} Daily Research Digest (${totalItems})`,
       digest,
     );
 
@@ -391,12 +460,12 @@ export async function runDigest(timeRange: string = "1d"): Promise<DigestResult>
     });
 
     const elapsed = ((Date.now() - start) / 1000).toFixed(1);
-    console.log(`[digest] sent ${results.length} item(s) in ${elapsed}s`);
+    console.log(`[digest] sent ${totalItems} item(s) in ${elapsed}s`);
     return {
       success: true,
-      itemCount: results.length,
+      itemCount: totalItems,
       elapsed,
-      message: `Digest sent (${results.length} items, ${elapsed}s)`,
+      message: `Digest sent (${totalItems} items, ${elapsed}s)`,
       digest,
     };
   } catch (e) {
